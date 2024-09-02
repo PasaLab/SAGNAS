@@ -1,8 +1,56 @@
 import torch
 from torch import nn
+from torch_cluster import knn_graph
 
 
-def _pairwise_distance(x):
+class Dilated(nn.Module):
+    """
+    Find dilated neighbor from neighbor list
+    """
+    def __init__(self, k=9, dilation=1, stochastic=False, epsilon=0.0):
+        super(Dilated, self).__init__()
+        self.dilation = dilation
+        self.stochastic = stochastic
+        self.epsilon = epsilon
+        self.k = k
+
+    def forward(self, edge_index, batch=None):
+        if self.stochastic:
+            if torch.rand(1) < self.epsilon and self.training:
+                num = self.k * self.dilation
+                randnum = torch.randperm(num)[:self.k]
+                edge_index = edge_index.view(2, -1, num)
+                edge_index = edge_index[:, :, randnum]
+                return edge_index.view(2, -1)
+            else:
+                edge_index = edge_index[:, ::self.dilation]
+        else:
+            edge_index = edge_index[:, ::self.dilation]
+        return edge_index
+
+
+class DilatedKnnGraph(nn.Module):
+    """
+    Find the neighbors' indices based on dilated knn
+    """
+    def __init__(self, k=9, dilation=1, stochastic=False, epsilon=0.0, knn='matrix'):
+        super(DilatedKnnGraph, self).__init__()
+        self.dilation = dilation
+        self.stochastic = stochastic
+        self.epsilon = epsilon
+        self.k = k
+        self._dilated = Dilated(k, dilation, stochastic, epsilon)
+        if knn == 'matrix':
+            self.knn = knn_graph_matrix
+        else:
+            self.knn = knn_graph
+
+    def forward(self, x, batch=None):
+        edge_index = self.knn(x, self.k * self.dilation, batch)
+        return self._dilated(edge_index, batch)
+
+
+def pairwise_distance(x):
     """
     Compute pairwise distance of a point cloud.
     Args:
@@ -15,79 +63,50 @@ def _pairwise_distance(x):
     return x_square + x_inner + x_square.transpose(2, 1)
 
 
-def _knn_matrix(x, k=16, self_loop=True):
+def knn_matrix(x, k=16, batch=None):
     """Get KNN based on the pairwise distance.
     Args:
-        x: (batch_size, num_dims, num_points, 1)
+        pairwise distance: (num_points, num_points)
         k: int
     Returns:
-        nearest neighbors: (batch_size, num_points ,k) (batch_size, num_points, k)
+        nearest neighbors: (num_points*k ,1) (num_points, k)
     """
-    x = x.transpose(2, 1).squeeze(-1)
-    batch_size, n_points, n_dims = x.shape
-    if self_loop:
-        _, nn_idx = torch.topk(-_pairwise_distance(x.detach()), k=k)
+    if batch is None:
+        batch_size = 1
     else:
-        _, nn_idx = torch.topk(-_pairwise_distance(x.detach()), k=k+1)
-        nn_idx = nn_idx[:, :, 1:]
-    center_idx = torch.arange(0, n_points, device=x.device).repeat(batch_size, k, 1).transpose(2, 1)
-    return torch.stack((nn_idx, center_idx), dim=0)
+        batch_size = batch[-1] + 1
+    x = x.view(batch_size, -1, x.shape[-1])
+
+    neg_adj = -pairwise_distance(x)
+    _, nn_idx = torch.topk(neg_adj, k=k)
+    del neg_adj
+
+    n_points = x.shape[1]
+    start_idx = torch.arange(0, n_points*batch_size, n_points).long().view(batch_size, 1, 1)
+    if x.is_cuda:
+        start_idx = start_idx.cuda()
+    nn_idx += start_idx
+    del start_idx
+
+    if x.is_cuda:
+        torch.cuda.empty_cache()
+
+    nn_idx = nn_idx.view(1, -1)
+    center_idx = torch.arange(0, n_points*batch_size).repeat(k, 1).transpose(1, 0).contiguous().view(1, -1)
+    if x.is_cuda:
+        center_idx = center_idx.cuda()
+    return nn_idx, center_idx
 
 
-class Dilated2d(nn.Module):
+def knn_graph_matrix(x, k=16, batch=None):
+    """Construct edge feature for each point
+    Args:
+        x: (num_points, num_dims)
+        batch: (num_points, )
+        k: int
+    Returns:
+        edge_index: (2, num_points*k)
     """
-    Find dilated neighbor from neighbor list
+    nn_idx, center_idx = knn_matrix(x, k, batch)
+    return torch.cat((nn_idx, center_idx), dim=0)
 
-    edge_index: (2, batch_size, num_points, k)
-    """
-    def __init__(self, k=9, dilation=1, stochastic=False, epsilon=0.0):
-        super(Dilated2d, self).__init__()
-        self.dilation = dilation
-        self.stochastic = stochastic
-        self.epsilon = epsilon
-        self.k = k
-
-    def forward(self, edge_index):
-        if self.stochastic:
-            raise NotImplementedError('stochastic currently is not supported')
-            # if torch.rand(1) < self.epsilon and self.training:
-            #     num = self.k * self.dilation
-            #     randnum = torch.randperm(num)[:self.k]
-            #     edge_index = edge_index[:, :, :, randnum]
-            # else:
-            #     edge_index = edge_index[:, :, :, ::self.dilation]
-        else:
-            edge_index = edge_index[:, :, :, ::self.dilation]
-        return edge_index
-
-
-class DilatedKnn2d(nn.Module):
-    """
-    Find the neighbors' indices based on dilated knn
-    """
-    def __init__(self, k=9, dilation=1, self_loop=True, stochastic=False, epsilon=0.0):
-        super(DilatedKnn2d, self).__init__()
-        self.dilation = dilation
-        self.stochastic = stochastic
-        self.epsilon = epsilon
-        self.k = k
-        self.self_loop = self_loop
-        self._dilated = Dilated2d(k, dilation, stochastic, epsilon)
-        self.knn = _knn_matrix
-
-    def forward(self, x):
-        edge_index = self.knn(x, self.k * self.dilation, self.self_loop)
-        return self._dilated(edge_index)
-
-
-def remove_self_loops(edge_index):
-    if edge_index[0, 0, 0, 0] == 0:
-        edge_index = edge_index[:, :, :, 1:]
-    return edge_index
-
-
-def add_self_loops(edge_index):
-    if edge_index[0, 0, 0, 0] != 0:
-        self_loops = torch.arange(0, edge_index.shape[2]).repeat(2, edge_index.shape[1], 1).unsqueeze(-1)
-        edge_index = torch.cat((self_loops.to(edge_index.device), edge_index[:, :, :, 1:]), dim=-1)
-    return edge_index
