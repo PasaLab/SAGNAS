@@ -22,7 +22,7 @@ import sampler as GraphSAINT
 # from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
 from model_search1 import Network
 from model import NetworkPPI as Model
-from architect1 import Architect
+from architect_author import Architect
 from tensorboardX import SummaryWriter
 from scipy.stats.stats import kendalltau
 from torch_geometric.utils import add_self_loops, remove_self_loops
